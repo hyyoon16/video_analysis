@@ -1,0 +1,70 @@
+import os
+import cv2
+import numpy as np
+
+# 1. 경로 설정
+SRC_DIR = '/gdrive/MyDrive/Colab Notebooks/VA/'
+DST_DIR = '/gdrive/MyDrive/Colab Notebooks/duplicate_remove/'
+
+def calculate_image_hash(image_path):
+    """이미지의 고유 특징값(평균 해시)을 계산하는 함수"""
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    img_resized = cv2.resize(img, (8, 8), interpolation=cv2.INTER_AREA)
+    avg = img_resized.mean()
+    hash_bits = (img_resized > avg).flatten()
+    return hash_bits  # 문자열 대신 비트 배열(boolean)로 반환
+
+def get_hamming_distance(hash1, hash2):
+    """두 해시 사이의 해밍 거리(다른 비트의 개수)를 계산"""
+    return np.count_nonzero(hash1 != hash2)
+
+def remove_duplicate_images(threshold=0.3):
+    """임계값을 적용하여 중복된 이미지를 필터링"""
+    os.makedirs(DST_DIR, exist_ok=True)
+    if not os.path.exists(SRC_DIR):
+        print(f"원본 폴더가 존재하지 않습니다: {SRC_DIR}")
+        return
+    
+    file_list = sorted(os.listdir(SRC_DIR))
+    
+    # 중복 비교를 위해 리스트에 해시 저장 (비교 로직을 위해)
+    seen_hashes = []
+    copied_count = 0
+    
+    for filename in file_list:
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            src_path = os.path.join(SRC_DIR, filename)
+            current_hash = calculate_image_hash(src_path)
+            
+            if current_hash is None:
+                continue
+            
+            # 이미 저장된 해시들과 비교
+            is_duplicate = False
+            for existing_hash in seen_hashes:
+                distance = get_hamming_distance(current_hash, existing_hash)
+                # 64비트 기준, 30% 이하(0.3)의 차이면 중복으로 판정
+                if distance / 64 <= threshold:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                seen_hashes.append(current_hash)
+                
+                # 이미지 저장
+                img = cv2.imread(src_path)
+                dst_path = os.path.join(DST_DIR, filename)
+                cv2.imwrite(dst_path, img)
+                
+                print(f"새 폴더로 저장 완료: {filename}")
+                copied_count += 1
+            else:
+                print(f"△ 중복 이미지 발견 (제외됨, 거리 비율 {distance/64:.2f}): {filename}")
+                
+    print(f"\n□ 작업 완료! 총 {copied_count}장의 중복 없는 이미지가 {DST_DIR}에 저장되었습니다.")
+
+if __name__ == '__main__':
+    # 임계값 0.3을 적용하여 실행
+    remove_duplicate_images(threshold=0.3)
