@@ -1,0 +1,48 @@
+import os
+import subprocess
+import cv2
+from google.colab import drive
+
+# 1. 구글 드라이브 마운트 및 경로 설정
+drive.mount('/gdrive')
+VIDEO_PATH = '/gdrive/MyDrive/Colab Notebooks/VA/sample_video.mp4'
+SAVE_DIR = '/gdrive/MyDrive/Colab Notebooks/VA/'
+
+def get_frame_types(video_fn):
+    """비디오의 모든 프레임 타입을 추출하는 함수"""
+    command = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'frame=pict_type',
+        '-of', 'default=noprint_wrappers=1'
+    ]
+
+    out = subprocess.check_output(command + [video_fn]).decode()
+    frame_types = out.replace('pict_type=', '').split()
+    return zip(range(len(frame_types)), frame_types)
+
+def save_i_keyframes(video_fn):
+    """비디오에서 I-프레임(Keyframe)만 추출하여 이미지로 저장하는 함수"""
+    frame_types = get_frame_types(video_fn)
+    i_frames = [x[0] for x in frame_types if x[1] == 'I']
+
+    if i_frames:
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        basename = os.path.splitext(os.path.basename(video_fn))[0]
+        cap = cv2.VideoCapture(video_fn)
+
+        for frame_no in i_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+            ret, frame = cap.read()
+
+            if ret:
+                out_name = f"{basename}_i_frame_{frame_no}.jpg"
+                save_path = os.path.join(SAVE_DIR, out_name)
+                cv2.imwrite(save_path, frame)
+                print(f"Saved: {out_name}")
+
+        cap.release()
+    else:
+        print(f"I-프레임을 찾을 수 없습니다: {video_fn}")
+
+if __name__ == '__main__':
+    save_i_keyframes(VIDEO_PATH)
