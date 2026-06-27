@@ -1,0 +1,90 @@
+import os
+import glob
+import shutil
+from PIL import Image as pil_image
+import numpy as np
+from sklearn.cluster import KMeans
+from keras.preprocessing import image
+from keras.applications.convnext import ConvNeXtSmall, preprocess_input
+from google.colab import drive
+
+# 1. 구글 드라이브 마운트
+drive.mount('/content/gdrive')
+
+# [전역 설정] 비정상적이거나 잘린 이미지 로드 시 에러 발생 방지
+image.LOAD_TRUNCATED_IMAGES = False
+
+# 2. 경로 및 전역 변수 설정
+INPUT_DIR = '/content/gdrive/MyDrive/Colab Notebooks/duplicate_remove/'
+OUTPUT_BASE_DIR = '/content/gdrive/MyDrive/Colab Notebooks/clustered_output/'
+NUM_CLUSTERS = 5 # 이미지 유사도에 따라 쪼갤 최종 그룹 개수
+
+# 3. Imagenet으로 사전 학습된 ConvNeXtSmall 모델 최상단 분류층 제외 로드
+model = ConvNeXtSmall(weights='imagenet', include_top=False, pooling='avg')
+
+def extract_features(image_path, model):
+    """ConvNeXtSmall 모델을 활용해 이미지 고유의 1차원 특징 벡터를 추출하는 함수"""
+    try:
+        # Keras 표준 타겟 사이즈로 이미지 로드
+        img = image.load_img(image_path, target_size=(224, 224))
+        
+        # 이미지 객체를 수치 넘파이 배열로 변환 및 배치 연산용 차원 확장
+        x = image.img_to_array(img)
+        x = np.expand_dims(x, axis=0)
+        
+        # ConvNeXt 전용 규격 색상 채널 및 스케일링 정규화 전처리
+        x = preprocess_input(x)
+        
+        # 모델 추론을 통해 압축된 특징 맵 추출 및 1차원 평탄화
+        features = model.predict(x)
+        return features.flatten()
+        
+    except Exception as e:
+        print(f"특징 추출 실패 ({image_path}): {e}")
+        return None
+
+def run_image_clustering():
+    """전체 파일을 분석하여 유사 그룹 폴더로 자동 매핑 전송하는 메인 함수"""
+    if not os.path.exists(INPUT_DIR):
+        print(f"입력 경로를 찾을 수 없습니다: {INPUT_DIR}")
+        return
+
+    # 확장자 검사를 통한 유효 사진 파일 리스트 수집
+    file_list = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+    features_list = []
+    valid_files = []
+
+    print("모든 이미지 대상 특징 벡터 수집 및 딥러닝 추론 시작...")
+    for filename in file_list:
+        img_path = os.path.join(INPUT_DIR, filename)
+        feats = extract_features(img_path, model)
+        if feats is not None:
+            features_list.append(feats)
+            valid_files.append(filename)
+
+    if not features_list:
+        print("군집화 연산을 수행할 이미지 데이터 장부가 비어있습니다.")
+        return
+
+    # K-Means 알고리즘 객체 생성 및 다차원 거리 예측 군집 연산
+    X = np.array(features_list)
+    kmeans = KMeans(n_clusters=NUM_CLUSTERS, random_state=42)
+    labels = kmeans.fit_predict(X)
+
+    # 분류 일람 가이드에 따라 실제 물리 하위 폴더 생성 후 파일 복사 마감
+    os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+    for filename, label in zip(valid_files, labels):
+        cluster_dir = os.path.join(OUTPUT_BASE_DIR, f"cluster_{label}")
+        os.makedirs(cluster_dir, exist_ok=True)
+
+        src_path = os.path.join(INPUT_DIR, filename)
+        dst_path = os.path.join(cluster_dir, filename)
+
+        shutil.copy(src_path, dst_path)
+        print(f"자동 정돈 매핑 완료: {filename} -> 그룹 {label}번 하위 디렉터리")
+
+    print(f"\n 이미지 클러스터링 파이프라인 정돈 완료! 결과 경로:\n{OUTPUT_BASE_DIR}")
+
+if __name__ == '__main__':
+    run_image_clustering()
