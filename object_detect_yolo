@@ -1,0 +1,133 @@
+import os
+import shutil
+from ultralytics import YOLO
+import pandas as pd # pandas 라이브러리 추가
+import cv2 # OpenCV 라이브러리 추가
+
+
+
+# 1. 디렉토리 경로 설정 (사용자 지정 경로 유지)
+INPUT_DIR = '/gdrive/MyDrive/Colab Notebooks/duplicate_remove/'  # 중복 제거 마감 파일 저장소
+BASE_OUTPUT_DIR = '/gdrive/MyDrive/Colab Notebooks/object/'       # 객체별 자동 분기 루트 폴더
+
+def run_objects365_detection_pipeline():
+    # 2. 진입 전 안전장치 확인
+    if not os.path.exists(INPUT_DIR):
+        print(f"입력 경로를 찾을 수 없습니다: {INPUT_DIR}")
+        return
+
+    # 3. Ultralytics 공식 Objects365 기학습 가중치 모델 로드
+    print("YOLO 모델 로드 중...") # 'Objects365' 언급 제거
+    model = YOLO('yolov8n.pt') # 'yolov8n-objects365.pt'에서 'yolov8n.pt'로 변경
+
+    # 4. 유효 이미지 확장자 필터링 스캔
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+    image_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(valid_extensions)]
+
+    if not image_files:
+        print("분석 대상 디렉토리 장부가 비어있습니다.")
+        return
+
+    print(f"총 {len(image_files)}장의 파일에 대해 사물 다중 검출 및 자동 맵핑을 시작합니다.\n")
+
+    detection_records = [] # 감지된 객체 정보를 저장할 리스트
+
+    # 5. 이미지 전수 루프 탐색
+    for filename in image_files:
+        img_path = os.path.join(INPUT_DIR, filename)
+
+        # 원본 이미지 로드 (OpenCV 사용)
+        original_img = cv2.imread(img_path)
+        if original_img is None:
+            print(f"이미지 로드 실패: {img_path}")
+            continue
+
+        # YOLO 추론 엔진 가동 (불필요한 내부 연산 출력 차단)
+        results = model(img_path, verbose=False)
+
+        # 다중 객체 검출 시 중복 폴더 생성을 차단하기 위한 고유 이름 셋(Set)
+        detected_classes = set()
+        
+        # 바운딩 박스를 그릴 이미지 (원본 이미지 복사본)
+        annotated_img = original_img.copy()
+
+        for result in results:
+            if result.boxes is not None:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    class_name = model.names[class_id]
+                    confidence = float(box.conf[0])
+
+                    # 경계 상자 좌표 추출 (xyxy 형식: x1, y1, x2, y2)
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+                    # 감지된 객체 정보 기록
+                    detection_records.append({
+                        'filename': filename,
+                        'object_class': class_name,
+                        'x_min': x1,
+                        'y_min': y1,
+                        'x_max': x2,
+                        'y_max': y2,
+                        'confidence': confidence
+                    })
+
+                    # 바운딩 박스 그리기
+                    color = (0, 255, 0) # 초록색
+                    thickness = 2
+                    cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, thickness)
+
+                    # 라벨 및 신뢰도 텍스트 추가
+                    label = f'{class_name}: {confidence:.2f}'
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.7
+                    font_thickness = 2
+                    text_size = cv2.getTextSize(label, font, font_scale, font_thickness)[0]
+                    text_x = x1
+                    text_y = y1 - 10 if y1 - 10 > 10 else y1 + text_size[1] + 10 # 텍스트 위치 조정
+                    
+                    # 텍스트 배경 그리기 (가독성을 위해)
+                    cv2.rectangle(annotated_img, (text_x, text_y - text_size[1] - 5), (text_x + text_size[0] + 5, text_y + 5), color, -1)
+                    cv2.putText(annotated_img, label, (text_x + 2, text_y), font, font_scale, (0, 0, 0), font_thickness, cv2.LINE_AA)
+
+                    # 파일명에 공백이나 특수문자가 있을 경우 폴더 생성을 위해 안전한 문자열 처리
+                    class_name_clean = class_name.replace(" ", "_").replace("/", "-")
+                    detected_classes.add(class_name_clean)
+
+        # 6. 미지 객체 대응형 동적 디렉토리 생성 및 다중 수납
+        if detected_classes:
+            print(f"{filename} -> 검출된 객체 목록: {list(detected_classes)}")
+
+            for obj_name in detected_classes:
+                # 일반화 일치 포맷 규칙 적용 (예: air_conditioner -> air_conditioner_detect)
+                target_folder_name = f"{obj_name}_detect"
+                target_dir = os.path.join(BASE_OUTPUT_DIR, target_folder_name)
+
+                # Objects365에서 새롭게 감지해낸 미지 항목의 폴더를 실시간 자동 빌드
+                os.makedirs(target_dir, exist_ok=True)
+
+                # 물리 파일 타겟 경로 매핑 후 전송 복사 마감
+                dst_path = os.path.join(target_dir, filename)
+                # 바운딩 박스가 그려진 이미지 저장
+                cv2.imwrite(dst_path, annotated_img)
+                print(f"[{target_folder_name}] 하위 수납폴더 복사 마감 (바운딩 박스 포함)")
+        else:
+            # 미검출 객체 혹은 분류되지 않은 객체 예외 처리
+            unclassified_dir = os.path.join(BASE_OUTPUT_DIR, "unclassified_detect")
+            os.makedirs(unclassified_dir, exist_ok=True)
+
+            # 무반응 객체는 원본 그대로 저장
+            shutil.copy(img_path, os.path.join(unclassified_dir, filename))
+            print(f"{filename} -> 무반응 객체 (unclassified_detect 폴더로 안전 보관)")
+
+    # 7. 감지된 객체 정보를 Excel 파일로 저장
+    if detection_records:
+        df_detections = pd.DataFrame(detection_records)
+        excel_output_path = os.path.join(BASE_OUTPUT_DIR, 'object_detections.xlsx')
+        df_detections.to_excel(excel_output_path, index=False)
+        print(f"\n감지된 객체 정보가 Excel 파일로 저장되었습니다: {excel_output_path}")
+
+    print(f"\n이미지 군집 정돈 자동화 파이프라인 완결! 저장 위치: {BASE_OUTPUT_DIR}") # 'Objects365' 언급 제거
+
+# 함수를 실행하려면 아래 주석을 해제하세요.
+run_objects365_detection_pipeline()
