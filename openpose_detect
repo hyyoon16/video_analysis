@@ -1,0 +1,251 @@
+import os
+import shutil
+import cv2
+import numpy as np
+import pandas as pd
+import urllib.request
+from ultralytics import YOLO
+
+# ==========================================
+# [PART 1] 글로벌 디렉터리 경로 및 환경 정의
+# ==========================================
+INPUT_DIR = '/gdrive/MyDrive/Colab Notebooks/duplicate_remove/'
+BASE_OUTPUT_DIR = '/gdrive/MyDrive/Colab Notebooks/object/'
+INPUT_PERSON_DIR = os.path.join(BASE_OUTPUT_DIR, 'person_detect')           # OpenPose 입력 (원본)
+PERSON_ANNOTATED_DIR = os.path.join(BASE_OUTPUT_DIR, 'person_detect_annotated')  # YOLO 시각화본
+OPENPOSE_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, 'pose_results')         # OpenPose 시각화 결과
+CSV_OPENPOSE_OUTPUT = os.path.join(BASE_OUTPUT_DIR, 'openpose_report.csv')
+
+# COCO 18 keypoint 모델 (BODY_PARTS와 일치)
+OPENPOSE_DIR = "/gdrive/MyDrive/Colab Notebooks/openpose/"
+PROTO_PATH = os.path.join(OPENPOSE_DIR, "pose_deploy_linevec.prototxt")
+MODEL_PATH = os.path.join(OPENPOSE_DIR, "pose_iter_440000.caffemodel")
+
+PROTO_URL = "https://raw.githubusercontent.com/CMU-Perceptual-Computing-Lab/openpose/master/models/pose/coco/pose_deploy_linevec.prototxt"
+MODEL_URL = "https://www.dropbox.com/s/2h2bv29a130sgrk/pose_iter_440000.caffemodel?dl=1"
+
+BODY_PARTS = {
+    0: "Nose", 1: "Neck", 2: "RShoulder", 3: "RElbow", 4: "RWrist",
+    5: "LShoulder", 6: "LElbow", 7: "LWrist", 8: "RHip", 9: "RKnee",
+    10: "RAnkle", 11: "LHip", 12: "LKnee", 13: "LAnkle", 14: "REye",
+    15: "LEye", 16: "REar", 17: "LEar"
+}
+
+POSE_PAIRS = [
+    [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7],
+    [1, 8], [8, 9], [9, 10], [1, 11], [11, 12], [12, 13],
+    [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]
+]
+
+
+def download_if_missing(url, path):
+    """파일이 없으면 다운로드하는 헬퍼 함수"""
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"⬇️  Downloading {os.path.basename(path)}...")
+        try:
+            urllib.request.urlretrieve(url, path)
+            print(f"   완료: {path}")
+            return True
+        except Exception as e:
+            print(f"   ❌ 다운로드 실패: {e}")
+            return False
+    return True
+
+
+# ==========================================
+# [STAGE 1] YOLO 다중 사물 검출 및 맵핑 엔진
+# ==========================================
+def run_objects_detection_pipeline():
+    if not os.path.exists(INPUT_DIR):
+        print(f"❌ 입력 경로를 찾을 수 없습니다: {INPUT_DIR}")
+        return False
+
+    print("🧠 YOLO 모델 로드 중...")
+    model = YOLO('yolov8n.pt')
+
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+    image_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(valid_extensions)]
+
+    if not image_files:
+        print("📭 분석 대상 디렉토리 장부가 비어있습니다.")
+        return False
+
+    print(f"🔮 총 {len(image_files)}장의 파일에 대해 사물 다중 검출 및 자동 맵핑을 시작합니다.\n")
+
+    detection_records = []
+
+    for filename in image_files:
+        img_path = os.path.join(INPUT_DIR, filename)
+        original_img = cv2.imread(img_path)
+        if original_img is None:
+            print(f"⚠️  이미지 로드 실패: {img_path}")
+            continue
+
+        results = model(img_path, verbose=False)
+        detected_classes = set()
+        annotated_img = original_img.copy()
+
+        for result in results:
+            if result.boxes is not None:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    class_name = model.names[class_id]
+                    confidence = float(box.conf[0])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+                    detection_records.append({
+                        'filename': filename,
+                        'object_class': class_name,
+                        'confidence': confidence,
+                        'x_min': x1, 'y_min': y1, 'x_max': x2, 'y_max': y2
+                    })
+
+                    cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"{class_name}: {confidence:.2f}"
+                    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                    text_y = y1 - 10 if y1 - 10 > 10 else y1 + text_size[1] + 10
+                    cv2.rectangle(annotated_img, (x1, text_y - text_size[1] - 4),
+                                  (x1 + text_size[0] + 4, text_y + 4), (0, 0, 0), -1)
+                    cv2.putText(annotated_img, label, (x1 + 2, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+                    class_name_clean = class_name.replace(" ", "_").replace("/", "-")
+                    detected_classes.add(class_name_clean)
+
+        if detected_classes:
+            print(f"🔍 {filename} -> 검출된 객체 목록: {list(detected_classes)}")
+            for obj_name in detected_classes:
+                target_folder_name = f"{obj_name}_detect"
+                target_dir = os.path.join(BASE_OUTPUT_DIR, target_folder_name)
+                os.makedirs(target_dir, exist_ok=True)
+
+                # person 클래스는 원본을 저장 (OpenPose가 깨끗한 입력을 받도록)
+                if obj_name == "person":
+                    cv2.imwrite(os.path.join(target_dir, filename), original_img)
+                    # 시각화본은 별도 폴더에 보관
+                    os.makedirs(PERSON_ANNOTATED_DIR, exist_ok=True)
+                    cv2.imwrite(os.path.join(PERSON_ANNOTATED_DIR, filename), annotated_img)
+                else:
+                    cv2.imwrite(os.path.join(target_dir, filename), annotated_img)
+
+                print(f"   └ 📂 [{target_folder_name}] 하위 수납폴더 복사 마감")
+        else:
+            unclassified_dir = os.path.join(BASE_OUTPUT_DIR, "unclassified_detect")
+            os.makedirs(unclassified_dir, exist_ok=True)
+            shutil.copy(img_path, os.path.join(unclassified_dir, filename))
+            print(f"📸 {filename} -> ⚪ 무반응 객체 (unclassified_detect 폴더로 안전 보관)")
+
+    if detection_records:
+        df_detections = pd.DataFrame(detection_records)
+        excel_output_path = os.path.join(BASE_OUTPUT_DIR, 'object_detections.xlsx')
+        df_detections.to_excel(excel_output_path, index=False)
+        print(f"\n📊 [완료] 감지된 객체 정보가 Excel 파일로 저장되었습니다: {excel_output_path}")
+
+    print(f"\n✅ STAGE 1 완결! 저장 위치: {BASE_OUTPUT_DIR}")
+    return True
+
+
+# ==========================================
+# [STAGE 2] OpenPose 단일 인물 관절 맵핑 엔진
+# (참고: 실제 다중 인물 PAF 파싱은 별도 구현 필요. 본 구현은 confidence map 기준 단일 인물)
+# ==========================================
+def run_openpose_pipeline():
+    print("\n🤖 STAGE 2: OpenPose Caffe 신경망 백본 로드 중...")
+
+    # 모델 파일 다운로드 (없을 때만)
+    if not download_if_missing(PROTO_URL, PROTO_PATH):
+        return
+    if not download_if_missing(MODEL_URL, MODEL_PATH):
+        return
+
+    if not os.path.exists(PROTO_PATH) or not os.path.exists(MODEL_PATH):
+        print(f"❌ OpenPose 가중치 파일을 찾을 수 없습니다.")
+        return
+
+    openpose_net = cv2.dnn.readNetFromCaffe(PROTO_PATH, MODEL_PATH)
+    openpose_records = []
+
+    if not os.path.exists(INPUT_PERSON_DIR):
+        print(f"⚠️  타겟 폴더가 존재하지 않습니다: {INPUT_PERSON_DIR}")
+        return
+
+    os.makedirs(OPENPOSE_OUTPUT_DIR, exist_ok=True)
+
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+    target_files = [f for f in os.listdir(INPUT_PERSON_DIR) if f.lower().endswith(valid_extensions)]
+
+    if not target_files:
+        print("📭 사람(person_detect) 폴더가 비어있습니다.")
+        return
+
+    print(f"🏃 총 {len(target_files)}장의 파일에 대해 관절 스케레톤 파싱을 시작합니다.")
+
+    for filename in target_files:
+        img_path = os.path.join(INPUT_PERSON_DIR, filename)
+        image = cv2.imread(img_path)
+        if image is None:
+            continue
+
+        h, w, _ = image.shape
+
+        # ✅ 수정: scalefactor (image_scale 아님), swapRB=True (OpenCV는 BGR로 읽음)
+        input_blob = cv2.dnn.blobFromImage(
+            image, scalefactor=1.0/255, size=(368, 368),
+            mean=(0, 0, 0), swapRB=True, crop=False
+        )
+        openpose_net.setInput(input_blob)
+        output_tensor = openpose_net.forward()
+
+        detected_points = {}
+        frame_record = {"filename": filename}
+
+        for part_id in range(len(BODY_PARTS)):
+            prob_map = output_tensor[0, part_id, :, :]
+            prob_map = cv2.resize(prob_map, (w, h))
+            _, max_prob, _, max_loc = cv2.minMaxLoc(prob_map)
+
+            if max_prob > 0.1:
+                part_name = BODY_PARTS[part_id]
+                detected_points[part_name] = (int(max_loc[0]), int(max_loc[1]), float(max_prob))
+                cv2.circle(image, max_loc, 5, (0, 255, 255), -1)
+
+        for pair in POSE_PAIRS:
+            part_a_name = BODY_PARTS[pair[0]]
+            part_b_name = BODY_PARTS[pair[1]]
+
+            if part_a_name in detected_points and part_b_name in detected_points:
+                pt_a = (detected_points[part_a_name][0], detected_points[part_a_name][1])
+                pt_b = (detected_points[part_b_name][0], detected_points[part_b_name][1])
+                frame_record[f"{part_a_name}_to_{part_b_name}_Link"] = "VALID"
+                cv2.line(image, pt_a, pt_b, (0, 255, 0), 2)
+
+        for part_name, data in detected_points.items():
+            frame_record[f"{part_name}_X"] = data[0]
+            frame_record[f"{part_name}_Y"] = data[1]
+            frame_record[f"{part_name}_Score"] = data[2]
+
+        openpose_records.append(frame_record)
+
+        # ✅ 수정: 결과 전용 폴더에 저장 (입력 폴더 오염 방지)
+        cv2.imwrite(os.path.join(OPENPOSE_OUTPUT_DIR, f"pose_{filename}"), image)
+        print(f"   📦 [관절 감지] -> {filename} (검출 관절 수: {len(detected_points)}개)")
+
+    if openpose_records:
+        df_openpose = pd.DataFrame(openpose_records)
+        df_openpose.to_csv(CSV_OPENPOSE_OUTPUT, index=False, encoding='utf-8-sig')
+        print(f"\n📊 [OpenPose 파싱 완결] 스케레톤 테이블이 완성되었습니다.")
+        print(f"📁 최종 CSV 위치: {CSV_OPENPOSE_OUTPUT}")
+        print(f"📈 데이터 행: {len(df_openpose)}건 (Columns: {len(df_openpose.columns)}개)")
+    else:
+        print("\n⚠️ 유효한 관절 데이터가 빌드되지 않았습니다.")
+
+
+# ==========================================
+# 메인
+# ==========================================
+if __name__ == '__main__':
+    stage1_success = run_objects_detection_pipeline()
+    if stage1_success:
+        run_openpose_pipeline()
+    print("\n🎉 전 공정 통합 이미지 엔지니어링 파이프라인 마감!")
