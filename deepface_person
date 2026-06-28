@@ -1,0 +1,297 @@
+import os
+import cv2
+import math
+import numpy as np
+import pandas as pd
+from deepface import DeepFace
+
+# ==========================================
+# [설정] 경로 및 디렉토리 자동화 정의
+# ==========================================
+INPUT_PERSON_DIR = '/gdrive/MyDrive/Colab Notebooks/object/person_detect/'
+CSV_ANALYSIS_OUTPUT = '/gdrive/MyDrive/Colab Notebooks/object/drama_narrative_report.csv'
+
+VIDEO_FPS = 29.97
+
+BACKBONE_MODEL = "ArcFace"
+
+# retinaface가 설치 문제를 일으키면 "opencv"로 바꾸세요.
+# DETECTOR_BACKEND = "retinaface"
+DETECTOR_BACKEND = "opencv"
+
+# ArcFace 코사인 거리 기준
+# 값이 작을수록 같은 사람일 가능성이 큼
+FACE_MATCH_THRESHOLD = 0.68
+
+# ==========================================
+# [보완] 코사인 거리 함수 직접 정의
+# ==========================================
+def find_cosine_distance(source_representation, test_representation):
+    a = np.asarray(source_representation, dtype=np.float32)
+    b = np.asarray(test_representation, dtype=np.float32)
+
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+
+    if denom == 0:
+        return 1.0
+
+    return 1 - np.dot(a, b) / denom
+
+
+# ==========================================
+# [보완] 한글 파일명 안전 이미지 로드
+# ==========================================
+def safe_imread(img_path):
+    try:
+        img_array = np.fromfile(img_path, np.uint8)
+        image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        return image
+    except Exception:
+        return None
+
+
+# ==========================================
+# [보완] 프레임 번호 추출 함수
+# ==========================================
+def extract_frame_sequence(filename):
+    digits = ''.join(filter(str.isdigit, filename))
+    if digits:
+        return int(digits)
+    return 0
+
+
+# ==========================================
+# [출력 디렉토리 자동 생성]
+# ==========================================
+output_csv_dir = os.path.dirname(CSV_ANALYSIS_OUTPUT)
+
+if not os.path.exists(output_csv_dir):
+    os.makedirs(output_csv_dir, exist_ok=True)
+
+
+# ==========================================
+# [초기화] 동적 얼굴 데이터베이스 버퍼 선언
+# ==========================================
+known_face_embeddings = []
+known_face_ids = []
+person_counter = 0
+
+raw_narrative_records = []
+
+
+# ==========================================
+# [실행] 프레임 전수 스캔 및 인물 서사 추출
+# ==========================================
+if not os.path.exists(INPUT_PERSON_DIR):
+    print(f"🎚 [소스 이미지 디렉토리를 찾을 수 없습니다: {INPUT_PERSON_DIR}]")
+
+else:
+    valid_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+
+    keyframe_files = sorted([
+        f for f in os.listdir(INPUT_PERSON_DIR)
+        if f.lower().endswith(valid_ext)
+        and not f.startswith('pose_drawn_')
+        and not f.startswith('face_drawn_')
+    ])
+
+    TOTAL_KEYFRAMES_COUNT = len(keyframe_files)
+
+    print(f"❑ 총 {TOTAL_KEYFRAMES_COUNT}장의 키프레임 대상 자동 인물 분류 분석을 시작합니다.\n")
+
+    for filename in keyframe_files:
+        img_path = os.path.join(INPUT_PERSON_DIR, filename)
+
+        image = safe_imread(img_path)
+
+        if image is None:
+            print(f"⬜ [오류] 파일을 읽을 수 없습니다 -> {filename}")
+            continue
+
+        img_h, img_w, _ = image.shape
+        screen_center_x = img_w / 2
+        screen_center_y = img_h / 2
+
+        frame_seq = extract_frame_sequence(filename)
+        timestamp_sec = frame_seq / VIDEO_FPS
+
+        # ==========================================
+        # 1단계: 얼굴 탐지 및 임베딩 추출
+        # ==========================================
+        try:
+            detected_faces = DeepFace.represent(
+                img_path=img_path,
+                model_name=BACKBONE_MODEL,
+                detector_backend=DETECTOR_BACKEND,
+                enforce_detection=False
+            )
+
+        except Exception as e:
+            print(f"⬜ [DeepFace 오류] {filename} -> {e}")
+            continue
+
+        if not isinstance(detected_faces, list):
+            detected_faces = [detected_faces]
+
+        if len(detected_faces) == 0:
+            print(f"⬜ [얼굴 없음] -> {filename}")
+            continue
+
+        for face_obj in detected_faces:
+
+            confidence = face_obj.get('face_confidence', face_obj.get('confidence', 1.0))
+
+            if confidence is not None and confidence < 0.4:
+                continue
+
+            if 'embedding' not in face_obj:
+                continue
+
+            current_embedding = face_obj['embedding']
+
+            box = face_obj.get('facial_area', {})
+
+            bx = box.get('x', 0)
+            by = box.get('y', 0)
+            bw = box.get('w', 0)
+            bh = box.get('h', 0)
+
+            if bw == 0 or bh == 0:
+                continue
+
+            face_center_x = bx + (bw / 2)
+            face_center_y = by + (bh / 2)
+
+            # ==========================================
+            # 2단계: 화면 중앙성 및 점유율 계산
+            # ==========================================
+            max_diagonal = math.sqrt(screen_center_x ** 2 + screen_center_y ** 2)
+
+            distance_from_center = math.sqrt(
+                (face_center_x - screen_center_x) ** 2
+                + (face_center_y - screen_center_y) ** 2
+            )
+
+            centrality = 1.0 - (distance_from_center / max_diagonal)
+
+            face_area = bw * bh
+            screen_area = img_w * img_h
+            scale_ratio = face_area / screen_area
+
+            # ==========================================
+            # 3단계: 기존 인물 DB와 비교 후 ID 부여
+            # ==========================================
+            if len(known_face_embeddings) == 0:
+                person_counter += 1
+                person_id = f"Person_{person_counter}"
+
+                known_face_embeddings.append(current_embedding)
+                known_face_ids.append(person_id)
+
+                min_distance = None
+
+            else:
+                distances = [
+                    find_cosine_distance(current_embedding, known_embedding)
+                    for known_embedding in known_face_embeddings
+                ]
+
+                min_distance_idx = int(np.argmin(distances))
+                min_distance = distances[min_distance_idx]
+
+                if min_distance < FACE_MATCH_THRESHOLD:
+                    person_id = known_face_ids[min_distance_idx]
+
+                    # 대표 임베딩을 조금씩 업데이트
+                    known_face_embeddings[min_distance_idx] = (
+                        0.8 * np.asarray(known_face_embeddings[min_distance_idx])
+                        + 0.2 * np.asarray(current_embedding)
+                    ).tolist()
+
+                else:
+                    person_counter += 1
+                    person_id = f"Person_{person_counter}"
+
+                    known_face_embeddings.append(current_embedding)
+                    known_face_ids.append(person_id)
+
+            # ==========================================
+            # 4단계: 결과 저장
+            # ==========================================
+            raw_narrative_records.append({
+                "filename": filename,
+                "frame_sequence": frame_seq,
+                "timestamp_seconds": timestamp_sec,
+                "person_id": person_id,
+                "bbox_x": bx,
+                "bbox_y": by,
+                "bbox_w": bw,
+                "bbox_h": bh,
+                "face_confidence": confidence,
+                "cosine_distance_to_matched_person": min_distance,
+                "centrality_index": centrality,
+                "screen_occupancy_scale": scale_ratio
+            })
+
+            if min_distance is None:
+                distance_text = "신규"
+            else:
+                distance_text = f"{min_distance:.4f}"
+
+            print(
+                f"❑ 👤 [{person_id}] -> "
+                f"중앙성: {centrality:.3f} | "
+                f"점유율: {scale_ratio:.4f} | "
+                f"거리: {distance_text} | "
+                f"파일: {filename}"
+            )
+
+
+# ==========================================
+# [출력] 데이터 분석 및 CSV 저장
+# ==========================================
+if raw_narrative_records:
+    df_base = pd.DataFrame(raw_narrative_records)
+
+    total_keyframes = max(1, TOTAL_KEYFRAMES_COUNT)
+
+    frequency_map = df_base['person_id'].value_counts()
+
+    df_base['frame_based_frequency_Fi'] = (
+        df_base['person_id'].map(frequency_map) / total_keyframes
+    )
+
+    # 공동 출현 행렬
+    co_occurrence_matrix = pd.crosstab(
+        df_base['filename'],
+        df_base['person_id']
+    )
+
+    co_occurrence_matrix = co_occurrence_matrix.T.dot(co_occurrence_matrix)
+
+    # CSV 저장
+    df_base.to_csv(
+        CSV_ANALYSIS_OUTPUT,
+        index=False,
+        encoding='utf-8-sig'
+    )
+
+    # 공동 출현 행렬도 별도 저장
+    co_output_path = CSV_ANALYSIS_OUTPUT.replace(
+        ".csv",
+        "_co_occurrence_matrix.csv"
+    )
+
+    co_occurrence_matrix.to_csv(
+        co_output_path,
+        encoding='utf-8-sig'
+    )
+
+    print("\n❑ [DeepFace 분석 완결]")
+    print(f"❑ 자동 분류된 고유 인물 수: {len(frequency_map)}명")
+    print(f"❑ 총 얼굴 탐지 기록 수: {len(df_base)}건")
+    print(f"❑ 최종 보고서 저장 위치: {CSV_ANALYSIS_OUTPUT}")
+    print(f"❑ 공동 출현 행렬 저장 위치: {co_output_path}")
+
+else:
+    print("\n[파이프라인 경고] 분석 결과 유효 데이터가 전무합니다.")
