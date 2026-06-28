@@ -1,0 +1,134 @@
+!pip install -q mediapipe
+!wget -O pose_landmarker.task -q https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task
+
+
+import os
+import cv2
+import pandas as pd
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import numpy as np
+
+# ==========================================
+# [설정] 경로 및 상수 정의
+# ==========================================
+INPUT_PERSON_DIR = '/gdrive/MyDrive/Colab Notebooks/object/person_detect/'
+CSV_OUTPUT_PATH = '/gdrive/MyDrive/Colab Notebooks/object/pose_landmarks_report.csv'
+MODEL_PATH = 'pose_landmarker.task'  # 다운로드받으신 모델 파일 경로
+
+# [보완] 출력 디렉토리 사전 자동 생성
+output_csv_dir = os.path.dirname(CSV_OUTPUT_PATH)
+if not os.path.exists(output_csv_dir):
+    os.makedirs(output_csv_dir, exist_ok=True)
+
+# BlazePose 33개 관절 매핑용 리스트 (CSV 컬럼명 매핑용)
+POSE_LANDMARK_NAMES = [
+    "NOSE", "LEFT_EYE_INNER", "LEFT_EYE", "LEFT_EYE_OUTER", "RIGHT_EYE_INNER",
+    "RIGHT_EYE", "RIGHT_EYE_OUTER", "LEFT_EAR", "RIGHT_EAR", "MOUTH_LEFT",
+    "MOUTH_RIGHT", "LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_ELBOW", "RIGHT_ELBOW",
+    "LEFT_WRIST", "RIGHT_WRIST", "LEFT_PINKY", "RIGHT_PINKY", "LEFT_INDEX",
+    "RIGHT_INDEX", "LEFT_THUMB", "RIGHT_THUMB", "LEFT_HIP", "RIGHT_HIP",
+    "LEFT_KNEE", "RIGHT_KNEE", "LEFT_ANKLE", "RIGHT_ANKLE", "LEFT_HEEL",
+    "RIGHT_HEEL", "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX"
+]
+
+# ==========================================
+# [초기화] 패키지 가동 및 추론 엔진 부팅
+# ==========================================
+print("❑ MediaPipe Tasks 최신 PoseLandmarker 엔진 부팅 중......")
+
+base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+options = vision.PoseLandmarkerOptions(
+    base_options=base_options,
+    output_segmentation_masks=False  # 속도 최적화를 위해 마스크 해제
+)
+detector = vision.PoseLandmarker.create_from_options(options)
+
+# ==========================================
+# [실행] BlazePose 33개 관절 좌표 다차원 추출
+# ==========================================
+pose_data_records = []
+
+if not os.path.exists(INPUT_PERSON_DIR):
+    print(f"🎚 [분석 타겟 '사람' 수납 폴더가 비어있거나 존재하지 않습니다: {INPUT_PERSON_DIR}]")
+else:
+    # 결과 이미지(pose_drawn_)는 입력 파일 스캔 대상에서 제외하여 무한 루프 방지
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+    person_images = [
+        f for f in os.listdir(INPUT_PERSON_DIR) 
+        if f.lower().endswith(valid_extensions) and not f.startswith('pose_drawn_')
+    ]
+    
+    print(f"❑ 총 {len(person_images)}장의 인물 사진에 대해 33개 관절 추출 오케스트레이션을 시작합니다.")
+    
+    for filename in person_images:
+        img_path = os.path.join(INPUT_PERSON_DIR, filename)
+        
+        # 한글 파일명 깨짐 방지 안전 로드
+        try:
+            img_array = np.fromfile(img_path, np.uint8)
+            image_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        except Exception:
+            image_bgr = None
+            
+        if image_bgr is None:
+            print(f"⬜ [오류] 파일을 읽을 수 없습니다 -> 파일명: {filename}")
+            continue
+            
+        # OpenCV BGR -> RGB 변환 후 MediaPipe 전용 이미지 객체 생성
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        
+        # 추론 수행
+        detection_result = detector.detect(mp_image)
+        
+        # 결과에 랜드마크가 존재하는지 확인
+        if detection_result.pose_landmarks:
+            print(f"❑ 🟥 [포즈 포착 성공] -> 파일명: {filename}")
+            current_frame_features = {"filename": filename}
+            
+            # 첫 번째 포착된 사람의 랜드마크 추출 (단일 인물 기준)
+            landmarks = detection_result.pose_landmarks[0]
+            img_height, img_width, _ = image_bgr.shape
+            
+            for index, landmark in enumerate(landmarks):
+                if index < len(POSE_LANDMARK_NAMES):
+                    landmark_name = POSE_LANDMARK_NAMES[index]
+                else:
+                    landmark_name = f"UNKNOWN_{index}"
+                
+                current_frame_features[f"{landmark_name}_X"] = landmark.x
+                current_frame_features[f"{landmark_name}_Y"] = landmark.y
+                current_frame_features[f"{landmark_name}_Z"] = landmark.z
+                current_frame_features[f"{landmark_name}_Visibility"] = landmark.visibility
+                
+                # 이미지 위에 시각화 원 그리기 (mp_drawing 대체 기본 캔버스 드로잉)
+                # 정규화 좌표(0~1)를 픽셀 좌표로 환산
+                cx, cy = int(landmark.x * img_width), int(landmark.y * img_height)
+                if 0 <= cx < img_width and 0 <= cy < img_height:
+                    cv2.circle(image_bgr, (cx, cy), 5, (0, 255, 0), -1)
+            
+            pose_data_records.append(current_frame_features)
+            
+            # 한글 파일명 깨짐 방지 안전 저장
+            output_img_path = os.path.join(INPUT_PERSON_DIR, f"pose_drawn_{filename}")
+            _, img_encoded = cv2.imencode(os.path.splitext(filename)[1], image_bgr)
+            img_encoded.tofile(output_img_path)
+        else:
+            print(f"❑ ⬜ [랜드마크 부실] -> 파일명: {filename} (인체 자세 불명확)")
+
+# ==========================================
+# [출력] 유효 데이터 적재 여부 최종 판별 및 CSV 파일 변환 마감
+# ==========================================
+if pose_data_records:
+    df_pose_report = pd.DataFrame(pose_data_records)
+    df_pose_report.to_csv(CSV_OUTPUT_PATH, index=False, encoding='utf-8-sig')
+    
+    print(f"\n❑ [분석 완결] 33개 관절 구조 기술 명세표 장부가 빌드되었습니다.")
+    print(f"❑ 최종 보고서 저장소 위치: {CSV_OUTPUT_PATH}")
+    print(f"❑ 총 분석 데이터 행(Rows) 수량: {len(df_pose_report)}건 (Columns: {len(df_pose_report.columns)}개)")
+else:
+    print("\n [파이프라인 경고] 분석 대상 사진들 중 자세가 포착된 유효 데이터가 전무합니다.")
+
+detector.close()
