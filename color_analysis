@@ -1,0 +1,128 @@
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+
+# # 1. 고정적 물리 디렉토리 경로 설정 및 분석 마스터 장부 저장소 정의
+INPUT_CLEAN_DIR = '/gdrive/MyDrive/Colab Notebooks/duplicate_remove/'  # 중복 제거 마감 키프레임 보관소
+CSV_COLOR_OUTPUT = '/gdrive/MyDrive/Colab Notebooks/object/color_narrative_report.csv'
+
+# # 2. 픽셀 표본화(Sampling)를 위한 이미지 해상도 축소 타겟 규격 정의
+RESIZE_WIDTH = 200
+RESIZE_HEIGHT = 112  # 16:9 종횡비 무결성 유지 규격
+
+# # 3. 색채 요약 압축을 위한 K-Means 군집화 마스터 개수(K) 설정
+DOMINANT_COLORS_COUNT = 5
+
+# 2. K-Means 지배 색상 추출 및 톤 범주 수학적 스캔 루프
+# # 4. 이미지별 색채 분석 아티팩트를 누적 수납할 마스터 버퍼 리스트 초기화
+color_analysis_records = []
+
+if not os.path.exists(INPUT_CLEAN_DIR):
+    print(f"분석 대상 중복 제거 폴더를 찾을 수 없습니다: {INPUT_CLEAN_DIR}")
+else:
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+    target_keyframes = sorted([f for f in os.listdir(INPUT_CLEAN_DIR) if f.lower().endswith(valid_extensions)])
+    
+    print(f"총 {len(target_keyframes)}장의 정제 파일 대상 K-Means 5대 색채 팔레트 해체를 시작합니다.\n")
+    
+    # # 5. 키프레임 이미지 전수 조사 루프 기동
+    for filename in target_keyframes:
+        img_path = os.path.join(INPUT_CLEAN_DIR, filename)
+        image_bgr = cv2.imread(img_path)
+        if image_bgr is None:
+            continue
+            
+        # [단계 1-2] 연산 부하 방지를 위한 고속 픽셀 표본화 축소 변환
+        sampled_img = cv2.resize(image_bgr, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+        
+        # [단계 2] 분석 시나리오 혼합을 위한 표준 RGB 채널 및 HSV 색상 공간 동시 이식
+        image_rgb = cv2.cvtColor(sampled_img, cv2.COLOR_BGR2RGB)
+        image_hsv = cv2.cvtColor(sampled_img, cv2.COLOR_BGR2HSV)
+        
+        # K-Means 수학적 행렬 연산을 위해 3차원 이미지 매트릭스를 2차원 픽셀 배열(22,400 x 3)로 평탄화
+        flattened_pixels_rgb = image_rgb.reshape(-1, 3)
+        flattened_pixels_hsv = image_hsv.reshape(-1, 3)
+        
+        # # 6. 비지도 학습 K-Means 머신러닝 엔진 가동
+        kmeans_engine = KMeans(n_clusters=DOMINANT_COLORS_COUNT, n_init=10, random_state=42)
+        kmeans_engine.fit(flattened_pixels_rgb)
+        
+        # 알고리즘 연산 결과물인 5대 중심점(대표 색상) 및 픽셀별 레이블 인출
+        rgb_centroids = kmeans_engine.cluster_centers_.astype(int)
+        pixel_labels = kmeans_engine.labels_
+        
+        # 각 군집별 픽셀 수량 집계를 통한 대표 색상 점유율(Weight) 계산
+        counts = np.bincount(pixel_labels)
+        total_pixels_sum = len(pixel_labels)
+        color_shares = counts / total_pixels_sum
+        
+        # 점유율 기준 내림차순 정렬 행렬 인덱스 반환
+        sorted_indices = np.argsort(color_shares)[::-1]
+        
+        # # 7. 의미적 해석(Semantic Interpretation)을 위한 통계량 연산 및 톤 범주 분류
+        total_hue, total_sat, total_val = 0, 0, 0
+        warm_share, cool_share, neutral_share = 0, 0, 0
+        
+        # 단일 키프레임의 종합 명도/채도 인상 지표 연산을 위한 전수 합산
+        for i in range(total_pixels_sum):
+            h_val, s_val, v_val = flattened_pixels_hsv[i]
+            total_hue += h_val
+            total_sat += s_val
+            total_val += v_val
+            
+            # HSV의 Hue(0~180 mapping) 기준 톤 범주 수학적 파싱
+            # 표준 각도계 환산 시 cv2 90(180도) 미만은 빨강, 주황, 노랑의 'Warm Tone'
+            actual_hue_degree = h_val * 2
+            
+            if 0 <= actual_hue_degree <= 60 or 330 <= actual_hue_degree <= 360:
+                warm_share += 1
+            elif 150 <= actual_hue_degree <= 270:
+                cool_share += 1
+            else:
+                neutral_share += 1
+                
+        # 픽셀 총량 기준 정규화 백분율 스케일링
+        mean_saturation = (total_sat / total_pixels_sum) / 255.0
+        mean_brightness = (total_val / total_pixels_sum) / 255.0
+        warm_ratio = warm_share / total_pixels_sum
+        cool_ratio = cool_share / total_pixels_sum
+        
+        # # 8. 단일 파일 처리 마감용 임시 딕셔너리 데이터 패킹
+        frame_record = {
+            "filename": filename,
+            "mean_saturation_index": mean_saturation,
+            "mean_brightness_index": mean_brightness,
+            "warm_tone_ratio": warm_ratio,
+            "cool_tone_ratio": cool_ratio
+        }
+        
+        # 정렬된 5대 지배 색상 데이터 순차 매핑 저장
+        for rank, idx in enumerate(sorted_indices):
+            r_c, g_c, b_c = rgb_centroids[idx]
+            hex_code = f"#{r_c:02X}{g_c:02X}{b_c:02X}"
+            share_val = color_shares[idx]
+            
+            frame_record[f"dominant_color_{rank+1}_HEX"] = hex_code
+            frame_record[f"dominant_color_{rank+1}_share"] = share_val
+            
+        color_analysis_records.append(frame_record)
+        print(f"■ [색채 요약 완결] -> 파일명: {filename} | 지배색: {frame_record['dominant_color_1_HEX']} ({frame_record['dominant_color_1_share']*100:.1f}%) | 따뜻한톤: {warm_ratio*100:.1f}%")
+
+# 3. 색채 매트릭스 테이블 빌드 및 저장
+# # 9. 수집 완료된 기초 특징량을 기반으로 판다스 마스터 장부 빌드 및 하드디스크 반환
+if color_analysis_records:
+    df_color_report = pd.DataFrame(color_analysis_records)
+    
+    # 디렉토리가 없을 경우 생성 처리 추가
+    os.makedirs(os.path.dirname(CSV_COLOR_OUTPUT), exist_ok=True)
+    
+    # # 10. 한국어 Windows 시스템 및 출판 기술 명세 표준 양식에 맞추어 영구 저장 마감
+    df_color_report.to_csv(CSV_COLOR_OUTPUT, index=False, encoding='utf-8-sig')
+    
+    print("\n■ [디지털 색채 분석 완결] K-Means 팔레트 서사 정형 데이터베이스 구축 완료.")
+    print(f"■ 최종 마스터 보고서 아티팩트 위치: {CSV_COLOR_OUTPUT}")
+    print(f"■ 최종 정형화 특징량 행(Rows) 수량: {len(df_color_report)}건 (Columns: {len(df_color_report.columns)}개)")
+else:
+    print("\n[파이프라인 경고] 전수 스캔 조사 결과, 추출된 색채 요약 데이터가 전무합니다.")
